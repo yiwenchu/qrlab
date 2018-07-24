@@ -46,6 +46,7 @@ end up with these five repositories
 - [H5Plot](http://github.com/philreinhold/h5plot)
 - [instrumentserver](http://git.yale.edu/rsl/instrumentserver)
 - [pulseseq](http://git.yale.edu/rsl/pulseseq)
+
 **
 
 In the `config.py` file, specify your preferred data directory. In the
