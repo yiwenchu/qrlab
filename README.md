@@ -9,7 +9,7 @@ Installation
 ### Python Installation
 
 - Grab [64-bit (x86-64) python 2.7](https://www.python.org/downloads/windows/)
-as of writing the most current version is 2.7.8
+as of writing the most current version is 2.7.8 (not yet compatible with Python 3.x)
 - Install additional libraries from [this wonderful resource](http://www.lfd.uci.edu/~gohlke/pythonlibs/), making sure to get 64bit / py2.7 versions
 - Make sure you get at least
   - [Scipy-stack](http://www.lfd.uci.edu/~gohlke/pythonlibs/#scipy-stack)
@@ -45,9 +45,8 @@ end up with these five repositories
 - [instrumentserver](http://git.yale.edu/rsl/instrumentserver)
 - [pulseseq](http://git.yale.edu/rsl/pulseseq)
 
-Copy the templates from the "templates" directory into the qrlab directory.
-In the `config.py` template, specify your preferred data directory. In the
-`create_instruments.py` template, setup your instrument classes following the 
+In the `config.py` file, specify your preferred data directory. In the
+`create_instruments.py` file, setup your instrument classes following the 
 patterns established therein.
 
 Test your installation out by running `start.bat`. A bunch of windows should
