@@ -1,0 +1,66 @@
+pulseseq, a python pulse sequencing library
+Reinier Heeres, 2013
+
+
+
+Overview
+
+Pulseseq provides a flexible set of tools to generate arbitrary pulse sequences
+which are not completely flattened, i.e. still consist of the smallest possible
+blocks, which allows repetitive parts to be re-used if hardware supports it.
+
+The sequences are constructed by appending pulse elements in a sequence object,
+with options such as combining and aligning which remind of CSS style layout
+generation. In the end, the sequence can be rendered into equal-length blocks
+for all the channels involved and plotted for inspection.
+
+
+
+Installing
+
+To install, run:
+
+    python setup.py install
+
+
+
+Examples
+
+The most convenient way to run the examples is in IPython:
+
+    ipython --pylab=qt
+
+then execute:
+
+    execfile('examples/t2echo.py')
+
+
+
+Terminology
+
+"Pulse": an object that represents a pulse to be played.
+
+"Pulse generator": an object that is not a pulse in itself, but when called
+will return a pulse instance.
+
+The use case is the following: let's say you want to perform a rotation, you
+could define it as follows:
+
+    r = AmplitudeRotation(Gaussian, 15, chans=(1,2))
+
+Now you can call this object to generate the proper pulses:
+
+    r(np.pi, 0)
+
+It is now very easy to change the actual rotation type:
+
+    r = AmplitudeRotation(Square, 15, chans=(1,2)
+
+
+
+Approach
+
+The pulse rendering sequence follows a two-step approach:
+- resolving: figure out the timing of all the pulses
+- generating: render the actual pulses
+
