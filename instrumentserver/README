@@ -1,0 +1,37 @@
+Python instrument server
+Reinier Heeres
+
+1. Introduction
+This instrument server provides a framework to use a simple python instrument
+driver to create a stand-alone process to communicate with an instrument. The
+process communicates with other processing using the 'objectsharer' module.
+Also included is a simple GUI to see and manipulate instrument parameters.
+
+The main benefit of using this framework is a unified structure of instrument
+control code as well as automatic type and range checking. By starting each
+instrument instance in a separate process you can talk to instruments in
+parallel (something which is a bit tricky to do in python in general).
+
+There should be plenty of examples of instrument drivers to get you going. A
+good starting point for a general GPIB/Visa compatible instrument would be
+'Agilent_FuncGen33250A'. For instruments which come with a DLL you have to
+know a bit more Python, but looking at LabBrick_RFSourceDLL.py might be useful.
+
+2. Writing / testing instruments
+Testing an instrument can be done from the command line if it contains a code
+section like this at the end:
+
+    if __name__ == '__main__':
+        logging.getLogger().setLevel(logging.DEBUG)
+        lb = Instrument.test(LabBrick_RFSourceDLL)
+
+1. Start cmd.exe
+2. Go to the 'instrumentserver' directory
+3. Make sure python.exe is in your path (edit system environment variable)
+4. Execute 'testins <driver name> <ins parameters>'
+   - Driver name is the filename WITHOUT .py
+   - Parameters can be specified for examples as --address GPIB::12 --delay 10
+
+This will automatically call all of the 'get' functions to see if they are
+working properly.
+
