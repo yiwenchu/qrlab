@@ -34,6 +34,8 @@ etc. Once there, run `git clone https://git.yale.edu/rsl/qrlab.git`. Which will
 prompt you for authentication. This will be your yale net id and password,
 assuming you have already logged in once.
 
+**don't need to do this part anymore. These repositories are included in qrlab now
+
 Run `install.bat` from the qrlab directory. This will clone several
 additional repositories from various places. The repositories from
 git.yale.edu will require your authentication.  You should
@@ -44,6 +46,7 @@ end up with these five repositories
 - [H5Plot](http://github.com/philreinhold/h5plot)
 - [instrumentserver](http://git.yale.edu/rsl/instrumentserver)
 - [pulseseq](http://git.yale.edu/rsl/pulseseq)
+**
 
 In the `config.py` file, specify your preferred data directory. In the
 `create_instruments.py` file, setup your instrument classes following the 
