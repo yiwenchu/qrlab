@@ -1,0 +1,684 @@
+import time
+import os
+from PyQt4 import Qt
+from widgets import *
+import objectsharer as objsh
+import pickle
+import sys
+import logging
+import traceback
+
+logger = logging.getLogger("Plot Window")
+logger.setLevel(logging.WARNING)
+handler = logging.StreamHandler()
+formatter = logging.Formatter('%(name)s:%(levelname)s:%(message)s')
+handler.setLevel(logging.WARNING)
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+from dataserver import DATA_DIRECTORY
+h5file_directory = DATA_DIRECTORY
+h5file_filter = 'HDF5 Files (*.h5)'
+
+objsh.DEFAULT_TIMEOUT = 10000
+
+
+class WindowItem(object):
+    """
+    An object with a presence in the data tree
+    """
+    registry = {}
+    data_tree_widget = None
+    attrs_widget_layout = None
+    def __init__(self, name, parent=None, attrs=None):
+        self.name = name
+        self.parent = parent
+        self.children = {}
+        if parent is not None:
+            parent.children[name] = self
+        self.path = parent.path if parent is not None else ()
+        self.path += (name,)
+        self.strpath = '/'.join(self.path)
+        assert self.path not in WindowItem.registry, self.strpath + " already exists"
+        WindowItem.registry[self.path] = self
+        self.tree_item = DataTreeWidgetItem(self.path, [name, "", ""])
+
+        if attrs is None:
+            self.attrs = {}
+        else:
+            self.attrs = attrs
+
+        self.attrs_widget = NodeEditWidget(self.path, self.attrs)
+        self.attrs_widget.setVisible(False)
+        self.attrs_widget_layout.addWidget(self.attrs_widget)
+
+        if parent is None:
+            self.data_tree_widget.addTopLevelItem(self.tree_item)
+        else:
+            parent.tree_item.addChild(self.tree_item)
+        self.data_tree_widget.resizeColumnToContents(0)
+
+    def root(self):
+        if self.parent is None:
+            return self
+        else:
+            return self.parent.root()
+
+    def child_plots_visible(self):
+        return any(c.child_plots_visible for c in self.children)
+
+    def update_tree_item(self, shape=None, visible=None):
+        if shape is not None:
+            self.tree_item.setText(1, str(shape))
+        if visible is not None:
+            self.tree_item.setText(2, str(visible))
+
+    def check_expand_state(self):
+        for c in self.children.values():
+            if isinstance(c, WindowPlot):
+                if c.plot and c.plot.is_visible():
+                    self.tree_item.setExpanded(False)
+                    return True
+            elif c.check_expand_state():
+                self.tree_item.setExpanded(False)
+                return True
+        self.tree_item.setExpanded(True)
+        return False
+
+    def update_attrs(self, attrs):
+        self.attrs.update(attrs)
+        self.attrs_widget.update_attrs(attrs)
+
+    def remove(self):
+        if self.parent is not None:
+            idx = self.tree_item.parent().indexOfChild(self.tree_item)
+            self.tree_item.parent().takeChild(idx)
+        else:
+            idx = self.data_tree_widget.indexOfTopLevelItem(self.tree_item)
+            self.data_tree_widget.takeTopLevelItem(idx)
+        del self.tree_item
+        del self.attrs_widget
+        del WindowItem.registry[self.path]
+
+
+class DataTreeWidgetItem(Qt.QTreeWidgetItem):
+    """
+    Subclass QTreeWidgetItem to give it a globally recognized identifier
+    """
+    def __init__(self, path, *args, **kwargs):
+        Qt.QTreeWidgetItem.__init__(self, *args, **kwargs)
+        self.path = path
+        self.strpath = '/'.join(self.path)
+
+    def is_leaf(self):
+        return self.childCount() == 0
+
+    def get_children(self):
+        for i in range(self.childCount()):
+            yield self.child(i)
+
+
+class WindowDataGroup(WindowItem):
+    """
+    A Data Tree Item corresponding to a (remote) shared DataGroup
+    """
+    def __init__(self, name, parent, proxy=None, **kwargs):
+        super(WindowDataGroup, self).__init__(name, parent, **kwargs)
+        logger.debug('Initializing WindowDataGroup %s' % self.strpath)
+
+        if proxy is None:
+            if parent is None:
+                raise ValueError("Top Level WindowDataGroups must be provided with a proxy")
+            self.proxy = parent.proxy[name]
+        else:
+            self.proxy = proxy
+        self.attrs_widget.set_proxy(self.proxy)
+
+        self.attrs = self.proxy.get_attrs()
+        self.update_attrs(self.attrs)
+
+        if not self.is_dataset():
+            self.children = {}
+            for name in self.proxy.keys():
+                self.update_child(name)
+
+            self.proxy.connect('changed', self.update_child)
+            self.proxy.connect('group-added', self.add_group)
+            #TODO connect removed
+
+        self.proxy.connect('attrs-changed', self.update_attrs)
+
+    def is_dataset(self):
+        return isinstance(self, WindowDataSet)
+
+    def update_child(self, key, slice=None):
+        if key not in self.children:
+            if hasattr(self.proxy[key], 'keys'):
+                self.add_group(key=key)
+            else:
+                self.add_dataset(key)
+            return
+        if hasattr(self.children[key], 'update_data'): # Confusing to me...
+            self.children[key].update_data(slice)
+
+    def add_group(self, key):
+        path = self.path + (key,)
+        if path in WindowItem.registry:
+            item = WindowItem.registry[path]
+            item.proxy = self.proxy[key]
+            return
+
+        g = WindowDataGroup(key, self)
+        for key in g.proxy.keys():
+            g.update_child(key)
+
+    def add_dataset(self, key):
+        return WindowDataSet(key, self)
+
+    def remove(self):
+        if not self.is_dataset():
+            for c in self.children.values():
+                c.remove()
+        super(WindowDataGroup, self).remove()
+
+class WindowPlot(WindowItem):
+    """
+    A plot living in the Dock Area
+    """
+    def __init__(self, name, parent, **kwargs):
+        super(WindowPlot, self).__init__(name, parent, **kwargs)
+        self.data = None
+        self.rank = None
+        self.plot = None
+
+        objsh.register(self, self.strpath)
+
+    def set_data(self, data):
+        self.data = np.array(data)
+        self.rank = self.get_rank()
+
+        default_attrs = {
+            'x0': 0,
+            'xscale': 1,
+            'xlabel': 'X',
+            'ylabel': 'Y',
+        }
+        if self.rank is 2:
+            default_attrs.update({
+                'y0': 0,
+                'yscale': 1,
+                'zlabel': 'Z',
+            })
+        # Update, but don't overwrite
+        self.update_attrs(
+            {k: v for k, v in default_attrs.items() if k not in self.attrs}
+        )
+
+        if self.plot is None:
+            if self.rank is 1:
+                self.plot = Rank1ItemWidget(self)
+            elif self.rank is 2:
+                if self.is_parametric():
+                    self.plot = Rank2ParametricWidget(self)
+                else:
+                    self.plot = Rank2ItemWidget(self)
+            else:
+                raise Exception('No rank ' + str(self.rank) + ' item widget')
+
+        self.plot.update_plot(self.data, self.attrs)
+        self.emit('data-changed')
+        self.update_tree_item(shape=self.data.shape, visible=self.plot.is_visible())
+
+    def set_attrs(self, attrs):
+        self.attrs = attrs
+
+    def is_parametric(self):
+        return self.attrs.get('parametric', False)
+
+    def get_rank(self):
+        if self.data is None or len(self.data) == 0:
+            return None
+        elif self.is_parametric():
+            return len(self.data[0]) - 1
+        else:
+            return len(self.data.shape)
+
+    def remove(self):
+        objsh.helper.unregister(self)
+        if self.plot is not None:
+            if self.plot.is_visible():
+                self.plot.toggle_hide()
+            del self.plot
+        super(WindowPlot, self).remove()
+
+class WindowMultiPlot(WindowItem):
+    def __init__(self, sources, parametric=False):
+        self.sources = sources
+        connector = " vs " if parametric else " :: "
+        name = connector.join(i.strpath for i in sources)
+
+        if ("multiplots",) not in WindowItem.registry:
+            WindowItem("multiplots", None)
+
+        multiplots_group = WindowItem.registry[("multiplots",)]
+        WindowItem.__init__(self, name, multiplots_group)
+
+        if parametric:
+            self.plot = ParametricItemWidget(self)
+        else:
+            self.plot = MultiplotItemWidget(self)
+            self.plot.line_plt.addLegend()
+
+        for source in sources:
+            self.update_source(source.path)
+            source.connect('data-changed', lambda: self.update_source(source.path))
+
+    def update_source(self, path):
+        item = WindowItem.registry[path]
+        self.plot.update_path(path, item.data, item.attrs)
+
+
+class WindowDataSet(WindowDataGroup, WindowPlot):
+    load = True
+    """
+    A WindowPlot which is kept in sync with a shared h5py DataSet
+    :param name: TODO
+    :param parent:
+    :param proxy:
+    :param attrs:
+    """
+    def __init__(self, name, parent, load=None, **kwargs):
+        super(WindowDataSet, self).__init__(name, parent, **kwargs)
+        logger.debug('Initializing WindowDataSet %s' % self.strpath)
+        if load is not None:
+            self.load = load
+        self.proxy.connect('resize', self.resize_data)
+        self.update_data()
+
+    def update_data(self, slice=None):
+        if self.load: # This is disabled on startup
+            logger.debug('Updating data at %s' % self.strpath)
+            print 'update', self.strpath
+            if self.data is None or slice is None:
+                self.data = self.proxy[:]
+            else:
+                self.data[slice] = self.proxy[slice]
+            if len(self.data) > 0:
+                self.set_data(self.data)
+
+    def resize_data(self, new_shape):
+        if self.data is None:
+            self.update_data()
+            return
+        if new_shape[0] > self.data.shape[0]:
+            delta = list(self.data.shape)
+            delta[0] = new_shape[0] - self.data.shape[0]
+            self.data = np.concatenate((self.data, np.zeros(delta)))
+        if len(new_shape) > 1:
+            if new_shape[1] > self.data.shape[1]:
+                delta = list(self.data.shape)
+                delta[1] = new_shape[1] - self.data.shape[1]
+                self.data = np.hstack((self.data, np.zeros(delta)))
+
+    def update_attrs(self, attrs):
+        super(WindowDataSet, self).update_attrs(attrs)
+        if self.plot and any(key in self.plot.plot_attrs for key in attrs.keys()):
+            self.plot.update_plot(self.data, self.attrs)
+
+
+class WindowInterface:
+    """
+    Shareable wrapper for a PlotWindow.
+    """
+    def __init__(self, window):
+        self.win = window
+        objsh.register(self, 'plotwin')
+
+    def get_all_plots(self):
+        return { k: v for k, v in WindowItem.registry.items() if isinstance(v, WindowPlot) }
+
+    def add_plot(self, name):
+        if (name,) in WindowItem.registry:
+            return WindowItem.registry[(name,)]
+        return WindowPlot(name, None)
+
+    def quit(self):
+        sys.exit()
+
+
+class PlotWindow(Qt.QMainWindow):
+    """
+    A window for viewing and plotting DataSets and DataGroups shared by a DataServer
+    """
+    def __init__(self):
+        Qt.QMainWindow.__init__(self)
+        self.setup_ui()
+        #self.data_groups = {}
+        self.setup_server()
+
+    def setup_ui(self):
+        # Sidebar / Dockarea
+        self.setCentralWidget(Qt.QSplitter())
+        self.sidebar = Qt.QWidget()
+        self.sidebar.setLayout(Qt.QVBoxLayout())
+        self.dock_area = MyDockArea()
+        ItemWidget.dock_area = self.dock_area
+        self.centralWidget().addWidget(self.sidebar)
+        self.centralWidget().addWidget(self.dock_area)
+        self.centralWidget().setSizes([250, 1000])
+
+        # Spinner setting number of plots to display simultaneously by default
+        self.max_plots_spinner = Qt.QSpinBox()
+        self.max_plots_spinner.setValue(4)
+        self.max_plots_spinner.valueChanged.connect(self.dock_area.set_max_plots)
+        max_plots_widget = Qt.QWidget()
+        max_plots_widget.setLayout(Qt.QHBoxLayout())
+        max_plots_widget.layout().addWidget(Qt.QLabel('Maximum Plot Count'))
+        max_plots_widget.layout().addWidget(self.max_plots_spinner)
+        self.sidebar.layout().addWidget(max_plots_widget)
+
+        # Structure Tree
+        sidebar_splitter = Qt.QSplitter(Qt.Qt.Vertical)
+        self.sidebar.layout().addWidget(sidebar_splitter)
+
+        self.data_tree_widget = Qt.QTreeWidget()
+        self.data_tree_widget.setColumnCount(3)
+        self.data_tree_widget.setHeaderLabels(['Name', 'Shape', 'Visible?'])
+        self.data_tree_widget.itemSelectionChanged.connect(self.change_edit_widget)
+        self.data_tree_widget.itemDoubleClicked.connect(self.toggle_item)
+        self.data_tree_widget.itemSelectionChanged.connect(self.configure_tree_actions)
+        self.data_tree_widget.setSelectionMode(Qt.QAbstractItemView.ExtendedSelection)
+        self.data_tree_widget.setColumnWidth(0, 150)
+        self.data_tree_widget.setColumnWidth(1, 50)
+        self.data_tree_widget.setColumnWidth(2, 50)
+        self.data_tree_widget.setColumnWidth(3, 50)
+        WindowItem.data_tree_widget = self.data_tree_widget
+        sidebar_splitter.addWidget(self.data_tree_widget)
+
+        # Structure Tree Context Menu
+        self.multiplot_action = Qt.QAction('Create Multiplot', self)
+        self.multiplot_action.triggered.connect(self.add_multiplot)
+        self.data_tree_widget.addAction(self.multiplot_action)
+
+        self.parametric_action = Qt.QAction('Plot Pair Parametrically', self)
+        self.parametric_action.triggered.connect(lambda: self.add_multiplot(True))
+        self.data_tree_widget.addAction(self.parametric_action)
+
+        self.show_subtree_action = Qt.QAction('Show Subtree', self)
+        self.show_subtree_action.triggered.connect(lambda: self.toggle_selection(show=True))
+        self.data_tree_widget.addAction(self.show_subtree_action)
+
+        self.hide_subtree_action = Qt.QAction('Hide Subtree', self)
+        self.hide_subtree_action.triggered.connect(lambda: self.toggle_selection(show=False))
+        self.data_tree_widget.addAction(self.hide_subtree_action)
+
+        self.delete_item_action = Qt.QAction('Delete item', self)
+        self.delete_item_action.triggered.connect(lambda: self.delete_item())
+        self.data_tree_widget.addAction(self.delete_item_action)
+
+        self.close_item_action = Qt.QAction('Close file', self)
+        self.close_item_action.triggered.connect(lambda: self.delete_item())
+        self.data_tree_widget.addAction(self.close_item_action)
+
+        self.rename_item_action = Qt.QAction('Rename item', self)
+        self.rename_item_action.triggered.connect(self.rename_item)
+        self.data_tree_widget.addAction(self.rename_item_action)
+
+        self.data_tree_widget.setContextMenuPolicy(Qt.Qt.ActionsContextMenu)
+        self.data_tree_widget.itemCollapsed.connect(lambda: self.data_tree_widget.resizeColumnToContents(0))
+        self.data_tree_widget.itemExpanded.connect(lambda: self.data_tree_widget.resizeColumnToContents(0))
+
+
+        # Attribute Editor Area
+        attrs_widget_box = Qt.QWidget()
+        attrs_widget_box.setLayout(Qt.QVBoxLayout())
+        WindowItem.attrs_widget_layout = attrs_widget_box.layout()
+        self.current_edit_widget = None
+        sidebar_splitter.addWidget(attrs_widget_box)
+
+        # Status Bar
+        self.connected_status = Qt.QLabel('Not Connected')
+        #self.view_status = Qt.QLabel('Empty')
+        self.current_files = None
+        self.statusBar().addWidget(self.connected_status)
+        #self.statusBar().addWidget(self.view_status)
+
+        self.connection_checker = Qt.QTimer()
+        self.connection_checker.timeout.connect(self.check_connection_status)
+
+        # Menu bar
+        file_menu = self.menuBar().addMenu('File')
+        self.connect_to_server_action = Qt.QAction('Connect to Dataserver', self)
+        self.connect_to_server_action.triggered.connect(lambda checked: self.connect_dataserver())
+        file_menu.addAction(self.connect_to_server_action)
+        self.load_file_action = Qt.QAction('Load File', self)
+        self.load_file_action.triggered.connect(lambda checked: self.load_file())
+        file_menu.addAction(self.load_file_action)
+
+    #######################
+    # Data Server Actions #
+    #######################
+
+    def setup_server(self):
+        self.zbe = objsh.ZMQBackend()
+        self.zbe.start_server('127.0.0.1', 55563)
+        try:
+            self.connect_dataserver()
+        except objsh.TimeoutError:
+            logger.warning('Could not connect to dataserver on startup')
+        self.public_interface = WindowInterface(self)
+        self.zbe.add_qt_timer()
+
+    def connect_dataserver(self):#, addr='127.0.0.1', port=55556):
+        addr = '127.0.0.1'
+        port = 55556
+        self.zbe.refresh_connection('tcp://%s:%d' % (addr, port))
+        self.dataserver = objsh.helper.find_object('dataserver', no_cache=True)
+        self.dataserver.connect('file-added', self.add_file)
+        WindowDataSet.load = False
+        for filename, proxy in self.dataserver.list_files(names_only=False).items():
+            self.add_file(filename, proxy)
+        WindowDataSet.load = True
+        self.connected_status.setText('Connected to tcp://%s:%d' % (addr, port))
+        self.connect_to_server_action.setEnabled(False)
+        self.load_file_action.setEnabled(True)
+        self.connection_checker.start(5000)
+
+    def check_connection_status(self):
+        try:
+            self.dataserver.hello(timeout=50)
+        except objsh.TimeoutError:
+            self.connected_status.setText('Not Connected')
+            self.connect_to_server_action.setEnabled(True)
+            self.load_file_action.setEnabled(False)
+            self.connection_checker.stop()
+
+    def add_file(self, filename, proxy=None):
+        if proxy is None:
+            proxy = self.dataserver.get_file(filename)
+        if os.path.dirname(filename) == h5file_directory:
+            filename = os.path.basename(filename)
+        if (filename,) in WindowItem.registry:
+            WindowItem.registry[(filename,)].remove()
+        WindowDataSet.load = False
+        WindowDataGroup(filename, None, proxy)
+        WindowDataSet.load = True
+
+    def delete_item(self, item=None):
+        if item is None:
+            item = self.data_tree_widget.selectedItems()[0]
+        if isinstance(item, DataTreeWidgetItem):
+            item = WindowItem.registry[item.path]
+        if item.parent is not None:
+            del item.parent.proxy[item.name]
+        else:
+            self.dataserver.remove_file(item.name)
+        item.remove()
+
+    def rename_item(self):
+        item = self.data_tree_widget.selectedItems()[0]
+        item = WindowItem.registry[item.path]
+        new_name, ok = Qt.QInputDialog.getText(self, "Renaming %s" % item.name, "New Name", Qt.QLineEdit.Normal, item.name)
+        new_name = str(new_name)
+        if ok and new_name and (new_name != item.name):
+            if item.parent is not None:
+                item.parent.proxy[new_name] = item.proxy
+                self.delete_item(item)
+            else:
+                pass
+
+    ####################
+    # Attribute Editor #
+    ####################
+
+    def change_edit_widget(self, item=None, col=None):
+        if item is None:
+            items = self.data_tree_widget.selectedItems()
+            if not items:
+                return
+            item = items[0]
+
+        logger.debug('Changing edit widget to %s' % item.strpath)
+        if self.current_edit_widget is not None:
+            self.current_edit_widget.hide()
+
+        widget = WindowItem.registry[item.path].attrs_widget
+        self.current_edit_widget = widget
+        widget.show()
+
+    ################
+    # File Buttons #
+    ################
+
+    def load_file(self):
+        filename = str(Qt.QFileDialog().getOpenFileName(self, 'Load HDF5 file', h5file_directory, h5file_filter))
+        if not filename:
+            return
+        self.dataserver.get_file(filename)
+
+    def save_view(self): # TODO
+        filename = str(Qt.QFileDialog().getSaveFileName(self, 'Save View file'))
+        open_plots = []
+        for group in self.data_groups.values():
+            if group.plot.parent() is not None:
+                open_plots.append(group.path)
+        dock_state = self.dock_area.saveState()
+        view_state = {
+            'open_plots': open_plots,
+            'dock_state': dock_state,
+        }
+        with open(filename, 'w') as f:
+            pickle.Pickler(f).save(view_state)
+
+
+    ##############
+    # Multiplots #
+    ##############
+
+    def add_multiplot(self, parametric=False, sourcepaths=None):
+        if sourcepaths is None:
+            selection = self.data_tree_widget.selectedItems()
+            sources = [WindowItem.registry[i.path] for i in selection]
+        else:
+            sources = [WindowItem.registry[path] for path in sourcepaths]
+        WindowMultiPlot(sources, parametric)
+
+    def remove_multiplot(self, paths, parametric=False):
+        if parametric:
+            widget = self.parametric_widgets.pop(paths)
+        else:
+            widget = self.multiplot_widgets.pop(paths)
+        for n in paths:
+            self.multiplots[n].remove(widget)
+        widget.setParent(None)
+
+    def update_multiplots(self, path, leaf):
+        for widget in self.multiplots['/'.join(path)]:
+            widget.update_plot(path, leaf)
+
+    def configure_tree_actions(self):
+        selection = self.data_tree_widget.selectedItems()
+        multiplot = len(selection) > 1
+        multiplot = multiplot and all(isinstance(WindowItem.registry[i.path], WindowDataSet) for i in selection)
+        multiplot = multiplot and all(WindowItem.registry[i.path].plot.rank == 1 for i in selection)
+        parametric = multiplot and len(selection) == 2
+        #if parametric:
+        #    item1, item2 = [WindowItem.registry[i.path] for i in selection]
+        #    parametric = parametric and item1.data.shape[0] == item2.data.shape[0]
+        self.multiplot_action.setEnabled(multiplot)
+        self.parametric_action.setEnabled(parametric)
+        is_file = all(i.parent() is None for i in selection)
+        is_group = all(i.parent() is not None for i in selection)
+        self.delete_item_action.setEnabled(len(selection) >= 1 and is_group)
+        self.close_item_action.setEnabled(len(selection) >= 1 and is_file)
+        self.rename_item_action.setEnabled(len(selection) == 1)
+
+
+    def toggle_selection(self, show=None):
+        for item in self.data_tree_widget.selectedItems():
+            self.toggle_item(item, 0, show)
+
+    def toggle_item(self, item, col, show=None):
+        if item.is_leaf():# and item.plot:
+            item = WindowItem.registry[item.path]
+            if item.plot is None and isinstance(item, WindowDataSet):
+                item.load = True
+                item.update_data()
+                if item.plot is None:
+                    raise Exception("Dataset is empty")
+            else:
+                item.plot.toggle_hide(show=show)
+            item.update_tree_item(visible=item.plot.is_visible())
+        else:
+            for child in item.get_children():
+                self.toggle_item(child, col, show)
+            WindowItem.registry[item.path].check_expand_state()
+        Qt.QApplication.instance().processEvents()
+
+
+#See http://stackoverflow.com/questions/2655354/how-to-allow-resizing-of-qmessagebox-in-pyqt4
+class ResizeableMessageBox(Qt.QMessageBox):
+    def __init__(self):
+        Qt.QMessageBox.__init__(self)
+        self.setSizeGripEnabled(True)
+
+    def event(self, e):
+        result = Qt.QMessageBox.event(self, e)
+
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        self.setMinimumWidth(0)
+        self.setMaximumWidth(16777215)
+        self.setSizePolicy(Qt.QSizePolicy.Expanding, Qt.QSizePolicy.Expanding)
+
+        textEdit = self.findChild(Qt.QTextEdit)
+        if textEdit != None :
+            textEdit.setMinimumHeight(0)
+            textEdit.setMaximumHeight(16777215)
+            textEdit.setMinimumWidth(0)
+            textEdit.setMaximumWidth(16777215)
+            textEdit.setSizePolicy(Qt.QSizePolicy.Expanding, Qt.QSizePolicy.Expanding)
+
+        return result
+
+def excepthook(error, instance, tb):
+    msg_box = ResizeableMessageBox()
+    msg_box.setText('Caught Exception of type ' + str(error).split("'")[1])
+    msg_box.setInformativeText(str(instance))
+    msg_box.setDetailedText("".join(traceback.format_tb(tb)))
+    msg_box.exec_()
+
+
+def run_plotwindow():
+    sys.excepthook = excepthook
+    app = Qt.QApplication([])
+    win = PlotWindow()
+    win.show()
+    #win.showMaximized()
+    win.setMinimumSize(700, 500)
+    app.connect(app, Qt.SIGNAL("lastWindowClosed()"), win, Qt.SIGNAL("lastWindowClosed()"))
+    return app.exec_()
+
+
+if __name__ == "__main__":
+    sys.exit(run_plotwindow())
